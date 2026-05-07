@@ -4,7 +4,7 @@
 
     let encodeFile = $state<File | null>(null);
     let encodeText = $state<string>("");
-    let downloadUrl = $state<string | null>(null);
+    let encodeKey = $state<string>("");
     let encodeError = $state<string>("");
     let ranges = $state<[number, number][]>([]);
     let encodedBlob = $state<Blob | null>(null);
@@ -21,12 +21,12 @@
     );
 
     let decodeFile = $state<File | null>(null);
+    let decodeKey = $state<string>("");
     let decodedText = $state<string>("");
     let decodeError = $state<string>("");
 
     async function handleEncode() {
         encodeError = "";
-        downloadUrl = null;
         encodedBlob = null;
         if (!encodeFile) {
             encodeError = "Please select a WAV file.";
@@ -36,12 +36,16 @@
             encodeError = "Please enter some text to hide.";
             return;
         }
+        // if (!encodeKey) {
+        //     encodeError = "Please enter a secret key.";
+        //     return;
+        // }
 
         try {
-            const result = await encodeLSB(encodeFile, encodeText);
+            const result = await encodeLSB(encodeFile, encodeText, encodeKey);
             ranges = result.ranges;
             encodedBlob = result.blob;
-            downloadUrl = URL.createObjectURL(result.blob);
+            download(result.blob, "encoded.wav");
         } catch (err: any) {
             encodeError = err.message || "Error occurred during encoding.";
         }
@@ -68,9 +72,13 @@
             decodeError = "Please select a WAV file to decode.";
             return;
         }
+        // if (!decodeKey) {
+        //     decodeError = "Please enter the secret key.";
+        //     return;
+        // }
 
         try {
-            decodedText = await decodeLSB(decodeFile);
+            decodedText = await decodeLSB(decodeFile, decodeKey);
         } catch (err: any) {
             decodeError = err.message || "Error occurred during decoding.";
         }
@@ -79,13 +87,22 @@
     async function onDecodeFileChange(e: Event) {
         const input = e.currentTarget as HTMLInputElement;
         decodeFile = input.files?.[0] || null;
-        if (decodeFile) {
-            await handleDecode();
-        }
+        handleDecode();
     }
+
+    const download = (blob: Blob, filename: string) => {
+        const url = URL.createObjectURL(blob);
+
+        Object.assign(document.createElement("a"), {
+            href: url,
+            download: filename
+        }).click();
+
+        URL.revokeObjectURL(url);
+    };
 </script>
 
-<h1>LSB Steganography in Audio</h1>
+<h1>LSB + PRNG Steganography in Audio</h1>
 
 <details open name="steganography" class="panel">
     <summary>Encode</summary>
@@ -107,6 +124,13 @@
         <small>{usedCapacityText}</small>
     </div>
 
+    <input
+        type="text"
+        bind:value={encodeKey}
+        placeholder="Enter secret key..."
+        style="width: 100%; padding: 0.5rem; margin: 0.5rem 0;"
+    />
+
     <div class="actions">
         <button onclick={handleEncode}>Encode & Generate WAV</button>
     </div>
@@ -115,38 +139,26 @@
         <p style="color: red;"><strong>Error:</strong> {encodeError}</p>
     {/if}
 
-    {#if downloadUrl && encodeFile && encodedBlob}
-        <article class="success">
-            <p><strong>Success!</strong> Data has been hidden.</p>
-            <a
-                href={downloadUrl}
-                download="encoded_output.wav"
-                role="button"
-                class="outline dl-btn"
-            >
-                Download Encoded WAV
-            </a>
-
-            <hr />
-
-            <Waveform audio={encodeFile} />
-
-            <hr />
-
-            <Waveform audio={encodedBlob} regions={ranges} />
-        </article>
+    {#if encodeFile && encodedBlob}
+        <p>Before:</p>
+        <Waveform audio={encodeFile} />
+        <p>After:</p>
+        <Waveform audio={encodedBlob} regions={ranges} />
     {/if}
 </details>
 
 <details name="steganography" class="panel">
     <summary>Decode</summary>
 
+    <input type="file" accept="audio/wav" onchange={onDecodeFileChange} />
+
     <label>
-        Encoded WAV File:
+        Secret Key:
         <input
-            type="file"
-            accept="audio/wav"
-            onchange={(e) => onDecodeFileChange(e)}
+            type="text"
+            bind:value={decodeKey}
+            oninput={handleDecode}
+            placeholder="Enter secret key..."
         />
     </label>
 
@@ -155,29 +167,14 @@
     {/if}
 
     {#if decodedText}
-        <article>
-            <header><strong>Extracted Secret:</strong></header>
-            <blockquote>{decodedText}</blockquote>
-        </article>
+        <label>
+            Extracted:
+            <textarea readonly rows="8">{decodedText}</textarea>
+        </label>
     {/if}
 </details>
 
 <style>
-    .success {
-        border-left: 4px solid #10b981;
-        background-color: var(--pico-card-background-color);
-    }
-    .dl-btn {
-        margin-bottom: 1rem;
-        display: inline-block;
-    }
-    .panel {
-        margin: 1rem 0;
-        padding: 1rem;
-        /* border: 1px solid var(--pico-border-color); */
-        border-radius: 6px;
-        /* background: var(--pico-card-background-color); */
-    }
     .capacity-row {
         display: flex;
         gap: 0.5rem;

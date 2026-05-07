@@ -15,6 +15,7 @@
 		"@sveltejs/adapter-static": "^3.0.10",
 		"@sveltejs/kit": "^2.57.0",
 		"@sveltejs/vite-plugin-svelte": "^7.0.0",
+		"@types/seedrandom": "^3.0.8",
 		"svelte": "^5.55.2",
 		"svelte-check": "^4.4.6",
 		"typescript": "^6.0.2",
@@ -23,6 +24,7 @@
 	"dependencies": {
 		"@thi.ng/bitstream": "^2.4.47",
 		"mediabunny": "^1.43.1",
+		"seedrandom": "^3.0.5",
 		"wavesurfer.js": "^7.12.6"
 	}
 }

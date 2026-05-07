@@ -1,16 +1,13 @@
 import { BitOutputStream, BitInputStream } from "@thi.ng/bitstream";
+import seedrandom from "seedrandom";
+import { WavOutputFormat, WAVE, Input, BlobSource, AudioSampleSink, Output, BufferTarget, AudioSampleSource, AudioSample, InputAudioTrack } from "mediabunny";
 
-
-import { WavOutputFormat, WAVE, Input, BlobSource, AudioBufferSink,AudioSampleSink, Output, BufferTarget, AudioSampleSource, AudioSample, EncodedPacketSink } from "mediabunny";
-
-    
 export interface EncodeResult {
     blob: Blob;
     ranges: [number, number][];
 }
 
-const EOF = '\0\0\0\0';
-
+const MAGIC = new Uint32Array([0x231, 0x00000000]);
 
 function format2bytes(format: string): number {
     switch (format) {
@@ -18,7 +15,7 @@ function format2bytes(format: string): number {
         case 's32-planar':
         case 'f32':
         case 'f32-planar':
-                return 4;
+            return 4;
         case 's16':
         case 's16-planar':
             return 2;
@@ -30,29 +27,23 @@ function format2bytes(format: string): number {
     }
 }
 
+async function hash(key: string): Promise<string> {
+    const data = new TextEncoder().encode(key);
+    const buffer = await crypto.subtle.digest("SHA-256", data);
+    return new Uint8Array(buffer).toString();
+}
+
+function shuffle<T>(rng: seedrandom.PRNG, array: T[]): void {
+    for (let i = array.length - 1; i > 0; i--) {
+        const j = Math.floor(rng() * (i + 1));
+        [array[i], array[j]] = [array[j], array[i]];
+    }
+}
 
 export async function capacityLSB(file: File): Promise<number> {
-    const input = new Input({
-        formats: [WAVE],
-        source: new BlobSource(file),
-    });
-
-    const audioTrack = await input.getPrimaryAudioTrack();
-    if (!audioTrack)
-        throw new Error('No audio track found in file.');
-
-    const sampleRate = await audioTrack.getSampleRate();
-    const numChannels = await audioTrack.getNumberOfChannels();
-    const duration = await audioTrack.computeDuration();
-    // const v2 = await audioTrack.getDurationFromMetadata();  
-    const availableBits = Math.floor(duration * sampleRate) * numChannels;
-
-
-    // const sink = new EncodedPacketSink(audioTrack);
-    // for await (const packet of sink.packets(undefined, undefined, { metadataOnly: true })) {
-    //     console.log(`Processed packet: ${JSON.stringify(packet)} frames, timestamp ${packet.timestamp}ms`);	// ...
-    // }
-    return availableBits;
+    const audio = await parseAudio(file);
+    const data = await capacities(audio);
+    return data.reduce((sum, capacity) => sum + capacity, 0) * 8;
 }
 
 
@@ -64,7 +55,7 @@ function chunk2bytes(chunk: AudioSample): Uint8Array {
     return data;
 }
 
-export async function encodeLSB(file: File, text: string): Promise<EncodeResult> {
+async function parseAudio(file: File): Promise<InputAudioTrack> {
     const input = new Input({
         formats: [WAVE],
         source: new BlobSource(file),
@@ -74,23 +65,13 @@ export async function encodeLSB(file: File, text: string): Promise<EncodeResult>
     if (!audioTrack)
         throw new Error('No audio track found in file.');
 
-    const sampleRate = await audioTrack.getSampleRate();
-    const numChannels = await audioTrack.getNumberOfChannels();
-    const duration = await audioTrack.computeDuration();
-    const v2 = await audioTrack.getDurationFromMetadata();
+    return audioTrack;
+}
 
-    const textBytes = new TextEncoder().encode(text + EOF);
-    const requiredBits = textBytes.length * 8;
-    const availableBits = Math.floor(duration * sampleRate) * numChannels;
-    const codec = await audioTrack.getCodec();
-    if (!codec) throw new Error('Unable to determine audio codec.');
-    console.log(audioTrack.getCodec());
-    if (requiredBits > availableBits) {
-        throw new Error(`WAV file is too small. Need ${requiredBits} bits, but only have ${availableBits}.`);
-    }
-
-    const bitInput = new BitInputStream(textBytes);
-    const mask = ~1;
+async function cloneAudio(audio: InputAudioTrack): Promise<[AudioSampleSource, Output<WavOutputFormat, BufferTarget>]> {
+    const codec = await audio.getCodec();
+    if (!codec)
+        throw new Error('Unable to determine audio codec.');
 
     const output = new Output({
         format: new WavOutputFormat(),
@@ -100,21 +81,96 @@ export async function encodeLSB(file: File, text: string): Promise<EncodeResult>
     const source = new AudioSampleSource({ codec });
     output.addAudioTrack(source);
     await output.start();
+    return [source, output] as const;
+}
 
-    const sink = new AudioSampleSink(audioTrack);
+async function capacities(audio: InputAudioTrack): Promise<number[]> {
+    const samples = []
 
+    const sink = new AudioSampleSink(audio);
+    for await (const packet of sink.samples()) {
+        const bytes = packet.allocationSize({ planeIndex: 0 });
+        samples.push(bytes / format2bytes(packet.format));
+    }
+
+    return samples;
+}
+
+async function sequentialSamples(audio: InputAudioTrack): Promise<[number, number][]> {
+    const data = await capacities(audio);
+    let sum = -data[0];
+    return data.map((capacity, index) => {
+        const result = [index, sum] as [number, number];
+        sum += capacity;
+        return result;
+    });
+}
+
+async function randomSamples(audio: InputAudioTrack, key: string): Promise<[number, number][]> {
+    const seed = await hash(key);
+    const rng = seedrandom(seed);
+    const data = await sequentialSamples(audio);
+    shuffle(rng, data);
+    return data;
+}
+
+export async function encodeLSB(file: File, text: string, key: string | null): Promise<EncodeResult> {
+    const audio = await parseAudio(file);
+    const sampleRate = await audio.getSampleRate();
+    const numChannels = await audio.getNumberOfChannels();
+
+
+    const textBytes = new TextEncoder().encode(text);
+    MAGIC[1] = textBytes.length;
+    const sizeInput = new BitInputStream(new Uint8Array(MAGIC.buffer));
+    const bitInput = new BitInputStream(textBytes);
+
+
+    const [source, output] = await cloneAudio(audio);
+    const sink = new AudioSampleSink(audio);
+
+    let cdf;
+    if (key) {
+        cdf = await randomSamples(audio, key);
+    } else {
+        cdf = await sequentialSamples(audio);
+    }
+
+    const ranges: [number, number][] = [];
+    let index = 0;
     for await (const chunk of sink.samples()) {
         const data = chunk2bytes(chunk);
-    
-        for (let i = 0; i < data.length; i+=format2bytes(chunk.format)) {
-            if (bitInput.position >= bitInput.length)
+        const step = format2bytes(chunk.format);
+        const [cdf_index, cdf_bits] = cdf[index++];
+
+        let should_write = true;
+        let input: BitInputStream;
+        if (cdf_index === 0) {
+            input = sizeInput;
+        } else if (cdf_bits < bitInput.length) {
+            input = bitInput;
+            input.seek(cdf_bits);
+        } else {
+            input = bitInput;
+            should_write = false;
+        }
+
+        for (let i = 0; i < data.length; i += step) {
+            if (input.position >= input.length) {
+                if (should_write)
+                    ranges.push([chunk.timestamp, chunk.timestamp + i / (sampleRate * numChannels)])
                 break;
-            data[i] = (data[i] & mask) |  bitInput.readBit();
+            }
+            data[i] = (data[i] & ~1) | input.readBit();
+        }
+
+        if (should_write && input.position < input.length) {
+            ranges.push([chunk.timestamp, chunk.timestamp + chunk.duration]);
         }
 
         let sample = new AudioSample({
             ...chunk,
-            data: data.buffer, 
+            data: data.buffer,
         });
 
         await source.add(sample);
@@ -122,59 +178,70 @@ export async function encodeLSB(file: File, text: string): Promise<EncodeResult>
     }
 
     await output.finalize();
-
     return {
         blob: new Blob([output.target.buffer!], { type: 'audio/wav' }),
-        ranges: [[0, bitInput.length / (sampleRate * numChannels)]],
+        ranges,
     };
 }
 
-export async function decodeLSB(file: File): Promise<string> {
-    const input = new Input({
-        formats: [WAVE],
-        source: new BlobSource(file),
-    });
-
-    const audioTrack = await input.getPrimaryAudioTrack();
-    if (!audioTrack) throw new Error('No audio track found in file.');
-
-    const sink = new AudioSampleSink(audioTrack);
-    const writer = new BitOutputStream();
-    let found = false;
-
-    outer:
+async function parseMagic(audio: InputAudioTrack, cdf: [number, number][]): Promise<number> {
+    const sink = new AudioSampleSink(audio);
+    let index = 0;
     for await (const chunk of sink.samples()) {
-        const data = new Uint8Array(chunk.allocationSize({ planeIndex: 0 }));
-        chunk.copyTo(data, { planeIndex: 0 });
-        chunk.close();
-
-        for (let i = 0; i < data.length; i+=format2bytes(chunk.format)) {
+        const [cdf_index, _] = cdf[index++];
+        if (cdf_index !== 0) {
+            continue;
+        }
+        const data = chunk2bytes(chunk);
+        const step = format2bytes(chunk.format);
+        const writer = new BitOutputStream();
+        for (let i = 0; i < 8 * MAGIC.byteLength * step; i += step) {
             writer.writeBit(data[i] & 1);
+        }
+        let output = new Uint32Array(writer.bytes().buffer);
+        if (output[0] !== MAGIC[0]) {
+            throw new Error('No hidden message found in the WAV file.');
+        }
+        return output[1];
+    }
+    throw new Error('Failed to read first audio chunk.');
+}
 
-            if (writer.position % 8 === 0 && ends(writer, EOF)) {
-                found = true;
-                break outer;
+export async function decodeLSB(file: File, key: string | null): Promise<string> {
+    const audio = await parseAudio(file);
+    let cdf;
+    if (key) {
+        cdf = await randomSamples(audio, key);
+    } else {
+        cdf = await sequentialSamples(audio);
+    }
+
+
+
+    const length = await parseMagic(audio, cdf);
+    const sink = new AudioSampleSink(audio);
+    const writer = new BitOutputStream(new Uint8Array(length));
+
+
+
+    let index = 0;
+    for await (const chunk of sink.samples()) {
+        const data = chunk2bytes(chunk);
+        const step = format2bytes(chunk.format);
+        const [cdf_index, cdf_bits] = cdf[index++];
+        if (cdf_index === 0 || cdf_bits >= 8 * length) {
+            continue;
+        } else {
+            writer.seek(cdf_bits);
+        }
+
+        for (let i = 0; i < data.length; i += step) {
+            if (writer.position < length * 8) {
+                writer.writeBit(data[i] & 1);
             }
         }
     }
 
-    if (!found) {
-        throw new Error('No hidden message found in the WAV file.');
-    }
 
-    const pad = writer.bytes();
-    const raw = pad.slice(0, pad.length - EOF.length);
-    return new TextDecoder().decode(raw);
-}
-
-
-function ends(haystack: BitOutputStream, eof: string): boolean {
-    const needle = Uint8Array.from(eof, c => c.charCodeAt(0));
-    const length = Math.ceil(haystack.position / 8);
-    
-    if (needle.length > length)
-        return false;
-    
-    const target = haystack.buffer.subarray(length - needle.length, length);
-    return needle.every((byte, i) => target[i] === byte);
+    return new TextDecoder().decode(writer.bytes());
 }
