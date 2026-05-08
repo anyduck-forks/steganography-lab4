@@ -175,9 +175,9 @@
     {/if}
 
     {#if decodedText}
-        <label>
+        <label style="width: 100%;">
             Extracted:
-            <textarea readonly rows="8">{decodedText}</textarea>
+            <textarea readonly rows="8" >{decodedText}</textarea>
         </label>
     {/if}
 </details>

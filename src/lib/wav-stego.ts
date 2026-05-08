@@ -170,7 +170,7 @@ export async function encodeLSB(file: File, text: string, key: string | null): P
 
         for (let k = 0; k < chunks; k++) {
             const cdf_bits = cdf_offsets[k];
-            if (cdf_bits + CHUNK_BITS >= input.length)
+            if (cdf_bits >= input.length)
                 continue;
             input.seek(cdf_bits);
             for (let p = 0; p < CHUNK_BITS; p++) {
@@ -259,15 +259,13 @@ export async function decodeLSB(file: File, key: string | null): Promise<string>
     for await (const chunk of sink.samples()) {
         const data = chunk2bytes(chunk);
         const step = format2bytes(chunk.format);
-        const [cdf_index, offsets] = cdf[index++] as [number, number[]];
-
-        const positions = Math.floor(data.length / step);
-        const chunkCount = Math.ceil(positions / CHUNK_BITS);
+        const [_, offsets] = cdf[index++] as [number, number[]];
+        const chunks = Math.floor(data.length / step / CHUNK_BITS);
 
 
-        for (let k = 0; k < chunkCount; k++) {
+        for (let k = 0; k < chunks; k++) {
             const cdf_bits = offsets[k];
-            if (cdf_bits + CHUNK_BITS >= length * 8)
+            if (cdf_bits >= length * 8)
                 continue;
             writer.seek(cdf_bits);
             for (let p = 0; p < CHUNK_BITS; p++) {
