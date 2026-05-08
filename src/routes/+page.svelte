@@ -5,6 +5,7 @@
     let encodeFile = $state<File | null>(null);
     let encodeText = $state<string>("");
     let encodeKey = $state<string>("");
+    let useEncodeKey = $state<boolean>(false);
     let encodeError = $state<string>("");
     let ranges = $state<[number, number][]>([]);
     let encodedBlob = $state<Blob | null>(null);
@@ -22,8 +23,17 @@
 
     let decodeFile = $state<File | null>(null);
     let decodeKey = $state<string>("");
+    let useDecodeKey = $state<boolean>(false);
     let decodedText = $state<string>("");
     let decodeError = $state<string>("");
+
+    $effect(() => {
+        if (!useEncodeKey) encodeKey = "";
+    });
+
+    $effect(() => {
+        if (!useDecodeKey) decodeKey = "";
+    });
 
     async function handleEncode() {
         encodeError = "";
@@ -36,13 +46,10 @@
             encodeError = "Please enter some text to hide.";
             return;
         }
-        // if (!encodeKey) {
-        //     encodeError = "Please enter a secret key.";
-        //     return;
-        // }
+        const key = useEncodeKey ? encodeKey : null;
 
         try {
-            const result = await encodeLSB(encodeFile, encodeText, encodeKey);
+            const result = await encodeLSB(encodeFile, encodeText, key);
             ranges = result.ranges;
             encodedBlob = result.blob;
             download(result.blob, "encoded.wav");
@@ -72,13 +79,10 @@
             decodeError = "Please select a WAV file to decode.";
             return;
         }
-        // if (!decodeKey) {
-        //     decodeError = "Please enter the secret key.";
-        //     return;
-        // }
+        const key = useDecodeKey ? decodeKey : null;
 
         try {
-            decodedText = await decodeLSB(decodeFile, decodeKey);
+            decodedText = await decodeLSB(decodeFile, key);
         } catch (err: any) {
             decodeError = err.message || "Error occurred during decoding.";
         }
@@ -95,7 +99,7 @@
 
         Object.assign(document.createElement("a"), {
             href: url,
-            download: filename
+            download: filename,
         }).click();
 
         URL.revokeObjectURL(url);
@@ -124,11 +128,14 @@
         <small>{usedCapacityText}</small>
     </div>
 
+    <input type="checkbox" bind:checked={useEncodeKey} id="use-encode-key" />
+    <label for="use-encode-key">Randomize </label>
     <input
         type="text"
         bind:value={encodeKey}
         placeholder="Enter secret key..."
-        style="width: 100%; padding: 0.5rem; margin: 0.5rem 0;"
+        style="margin-top: var(--pico-spacing);"
+        disabled={!useEncodeKey}
     />
 
     <div class="actions">
@@ -152,15 +159,16 @@
 
     <input type="file" accept="audio/wav" onchange={onDecodeFileChange} />
 
-    <label>
-        Secret Key:
-        <input
-            type="text"
-            bind:value={decodeKey}
-            oninput={handleDecode}
-            placeholder="Enter secret key..."
-        />
-    </label>
+    <input type="checkbox" bind:checked={useDecodeKey} id="use-decode-key" />
+    <label for="use-decode-key">Randomize</label>
+    <input
+        type="text"
+        bind:value={decodeKey}
+        oninput={handleDecode}
+        placeholder="Enter secret key..."
+        style="margin-top: var(--pico-spacing);"
+        disabled={!useDecodeKey}
+    />
 
     {#if decodeError}
         <p style="color: red;"><strong>Error:</strong> {decodeError}</p>
@@ -183,6 +191,7 @@
     }
     .capacity-row progress {
         flex-grow: 1;
+        margin-bottom: 0;
     }
     .capacity-row small {
         white-space: nowrap;
