@@ -8,6 +8,7 @@ export interface EncodeResult {
 }
 
 const MAGIC = new Uint32Array([0x231, 0x00000000]);
+const CHUNK_BITS = 4 * 32; 
 
 function format2bytes(format: string): number {
     switch (format) {
@@ -96,35 +97,56 @@ async function capacities(audio: InputAudioTrack): Promise<number[]> {
     return samples;
 }
 
-async function sequentialSamples(audio: InputAudioTrack): Promise<[number, number][]> {
-    const data = await capacities(audio);
-    let sum = -data[0];
-    return data.map((capacity, index) => {
-        const result = [index, sum] as [number, number];
-        sum += capacity;
-        return result;
-    });
+async function sequentialSamples(audio: InputAudioTrack): Promise<[number, number[]][]> {
+    const capacity = await capacities(audio);
+    const result: [number, number[]][] = [];
+
+    let cumulative = 0;
+    for (let index = 0; index < capacity.length; index++) {
+        const chunks = Math.floor(capacity[index] / CHUNK_BITS);
+        const offsets: number[] = [];
+        for (let k = 0; k < chunks; k++) {
+            offsets.push(cumulative);
+            cumulative += CHUNK_BITS;
+        }
+        result.push([index, offsets]);
+    }
+    return result;
 }
 
-async function randomSamples(audio: InputAudioTrack, key: string): Promise<[number, number][]> {
+async function randomSamples(audio: InputAudioTrack, key: string): Promise<[number, number[]][]> {
     const seed = await hash(key);
     const rng = seedrandom(seed);
     const data = await sequentialSamples(audio);
+    for (const [, offsets] of data) {
+        shuffle(rng, offsets);
+    }
     shuffle(rng, data);
     return data;
+}
+
+function padLength(length: number): number {
+    const chunkBytes = CHUNK_BITS / 8;
+    return Math.ceil(length / chunkBytes) * chunkBytes;
+}
+
+
+function text2bits(text: string) {
+    const textBytes = new TextEncoder().encode(text);
+    const length = MAGIC.byteLength + textBytes.length;
+    MAGIC[1] = length;
+    const buffer = new Uint8Array(padLength(length));
+    buffer.set(new Uint8Array(MAGIC.buffer), 0);
+    buffer.set(textBytes, MAGIC.byteLength);
+    const input = new BitInputStream(buffer);
+    return input;
 }
 
 export async function encodeLSB(file: File, text: string, key: string | null): Promise<EncodeResult> {
     const audio = await parseAudio(file);
     const sampleRate = await audio.getSampleRate();
     const numChannels = await audio.getNumberOfChannels();
-
-
-    const textBytes = new TextEncoder().encode(text);
-    MAGIC[1] = textBytes.length;
-    const sizeInput = new BitInputStream(new Uint8Array(MAGIC.buffer));
-    const bitInput = new BitInputStream(textBytes);
-
+    const input = text2bits(text);
 
     const [source, output] = await cloneAudio(audio);
     const sink = new AudioSampleSink(audio);
@@ -141,32 +163,31 @@ export async function encodeLSB(file: File, text: string, key: string | null): P
     for await (const chunk of sink.samples()) {
         const data = chunk2bytes(chunk);
         const step = format2bytes(chunk.format);
-        const [cdf_index, cdf_bits] = cdf[index++];
+        const [_, cdf_offsets] = cdf[index++];
+        const chunks = Math.floor(data.length / step / CHUNK_BITS);
 
-        let should_write = true;
-        let input: BitInputStream;
-        if (cdf_index === 0) {
-            input = sizeInput;
-        } else if (cdf_bits < bitInput.length) {
-            input = bitInput;
+        let tempRanges: [number, number][] = [];
+
+        for (let k = 0; k < chunks; k++) {
+            const cdf_bits = cdf_offsets[k];
+            if (cdf_bits + CHUNK_BITS >= input.length)
+                continue;
             input.seek(cdf_bits);
-        } else {
-            input = bitInput;
-            should_write = false;
-        }
-
-        for (let i = 0; i < data.length; i += step) {
-            if (input.position >= input.length) {
-                if (should_write)
-                    ranges.push([chunk.timestamp, chunk.timestamp + i / (sampleRate * numChannels)])
-                break;
+            for (let p = 0; p < CHUNK_BITS; p++) {
+                const idx = (k * CHUNK_BITS + p) * step;
+                data[idx] = (data[idx] & ~1) | input.readBit();
             }
-            data[i] = (data[i] & ~1) | input.readBit();
+            const chunkDuration = CHUNK_BITS * numChannels / sampleRate
+            const chunkStart = chunk.timestamp + k * chunkDuration;
+            tempRanges.push([chunkStart, chunkStart+ chunkDuration]);
         }
 
-        if (should_write && input.position < input.length) {
+        if (tempRanges.length === chunks) {
             ranges.push([chunk.timestamp, chunk.timestamp + chunk.duration]);
+        } else {
+            ranges.push(...tempRanges);
         }
+
 
         let sample = new AudioSample({
             ...chunk,
@@ -184,20 +205,30 @@ export async function encodeLSB(file: File, text: string, key: string | null): P
     };
 }
 
-async function parseMagic(audio: InputAudioTrack, cdf: [number, number][]): Promise<number> {
+async function parseMagic(audio: InputAudioTrack, cdf: [number, number[]][]): Promise<number> {
     const sink = new AudioSampleSink(audio);
     let index = 0;
     for await (const chunk of sink.samples()) {
-        const [cdf_index, _] = cdf[index++];
+        const [cdf_index, cdf_offsets] = cdf[index++];
         if (cdf_index !== 0) {
             continue;
         }
         const data = chunk2bytes(chunk);
         const step = format2bytes(chunk.format);
-        const writer = new BitOutputStream();
-        for (let i = 0; i < 8 * MAGIC.byteLength * step; i += step) {
-            writer.writeBit(data[i] & 1);
+        const chunks = Math.floor(data.length / step / CHUNK_BITS);
+        const writer = new BitOutputStream(new Uint8Array(padLength(MAGIC.byteLength)));
+
+        for (let k = 0; k < chunks; k++) {
+            const cdf_bits = cdf_offsets[k];
+            if (cdf_bits >= 8 * MAGIC.byteLength)
+                continue;
+            writer.seek(cdf_bits);
+            for (let p = 0; p < CHUNK_BITS; p++) {
+                const idx = (k * CHUNK_BITS + p) * step;
+                writer.writeBit(data[idx] & 1);
+            }
         }
+
         let output = new Uint32Array(writer.bytes().buffer);
         if (output[0] !== MAGIC[0]) {
             throw new Error('No hidden message found in the WAV file.');
@@ -220,7 +251,7 @@ export async function decodeLSB(file: File, key: string | null): Promise<string>
 
     const length = await parseMagic(audio, cdf);
     const sink = new AudioSampleSink(audio);
-    const writer = new BitOutputStream(new Uint8Array(length));
+    const writer = new BitOutputStream(new Uint8Array(padLength(length)));
 
 
 
@@ -228,20 +259,24 @@ export async function decodeLSB(file: File, key: string | null): Promise<string>
     for await (const chunk of sink.samples()) {
         const data = chunk2bytes(chunk);
         const step = format2bytes(chunk.format);
-        const [cdf_index, cdf_bits] = cdf[index++];
-        if (cdf_index === 0 || cdf_bits >= 8 * length) {
-            continue;
-        } else {
-            writer.seek(cdf_bits);
-        }
+        const [cdf_index, offsets] = cdf[index++] as [number, number[]];
 
-        for (let i = 0; i < data.length; i += step) {
-            if (writer.position < length * 8) {
-                writer.writeBit(data[i] & 1);
+        const positions = Math.floor(data.length / step);
+        const chunkCount = Math.ceil(positions / CHUNK_BITS);
+
+
+        for (let k = 0; k < chunkCount; k++) {
+            const cdf_bits = offsets[k];
+            if (cdf_bits + CHUNK_BITS >= length * 8)
+                continue;
+            writer.seek(cdf_bits);
+            for (let p = 0; p < CHUNK_BITS; p++) {
+                const idx = (k * CHUNK_BITS + p) * step;
+                writer.writeBit(data[idx] & 1);
             }
         }
     }
 
-
-    return new TextDecoder().decode(writer.bytes());
+    const buffer = writer.bytes().subarray(0, length).subarray(MAGIC.byteLength);
+    return new TextDecoder().decode(buffer);
 }
