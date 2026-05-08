@@ -8,7 +8,7 @@ const config = {
 	},
 	kit: {
 		adapter: adapter({
-			fallback: '200.html'
+			fallback: 'index.html'
 		}),
 		paths: {
             base: process.env.NODE_ENV === 'production' ? '/steganography-lab4' : '',
